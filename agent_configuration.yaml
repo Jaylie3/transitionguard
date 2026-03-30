@@ -1,0 +1,516 @@
+# TransitionGuard Agent Configuration
+# Prompt Opinion A2A Agent Definition Language
+
+---
+name: TransitionGuard
+version: "1.0"
+type: "orchestrator"
+description: "Intelligent discharge coordinator that assembles comprehensive Transition Care Packets in under 60 seconds"
+
+# ============================================================================
+# PRIMARY ORCHESTRATOR AGENT
+# ============================================================================
+orchestrator:
+  primary_agent: "TransitionGuard"
+  description: "Receives discharge trigger, coordinates specialist sub-agents, assembles final Transition Care Packet"
+  
+  # Trigger: Patient discharge event
+  trigger:
+    type: "fhir_resource_change"
+    resource: "Encounter"
+    condition: 'status == "finished"'
+    priority: "immediate"
+  
+  # System Context & Instructions
+  system_context: |
+    You are TransitionGuard, an intelligent care coordination agent deployed on the Prompt Opinion healthcare platform.
+    
+    Your job: When a patient is discharged from the hospital, you have 60 seconds to assemble a complete Transition Care Packet.
+    
+    This packet includes:
+    1. LACE+ readmission risk score (quantified, evidence-based)
+    2. Medication reconciliation (discharge meds vs home meds)
+    3. Care gaps identified (missing follow-ups, unaddressed social needs)
+    4. Patient education (plain-language discharge instructions)
+    
+    You coordinate with two specialist sub-agents:
+    - CareGap Agent: Identifies missing follow-ups and clinical gaps
+    - PatientEd Agent: Translates clinical info into patient-friendly instructions
+    
+    Workflow:
+    1. Query FHIR for full patient context (last 90 days)
+    2. Invoke MCP tools to calculate LACE+, Charlson, check interactions
+    3. Delegate gap analysis to CareGap agent
+    4. Delegate patient education to PatientEd agent
+    5. Synthesize outputs into single Transition Care Packet
+    6. Output to EHR & patient portal
+  
+  # Step-by-step execution plan
+  steps:
+    - step_id: "1_query_fhir"
+      name: "Query FHIR for Patient Context"
+      description: "Retrieve complete patient data from EHR"
+      actions:
+        - query: "GET /Encounter/{encounter_id}"
+          store_as: "encounter"
+          include: ["status", "period.end", "hospitalization.dischargeDisposition"]
+        
+        - query: "GET /Patient/{patient_id}"
+          store_as: "patient"
+          include: ["identifier", "name", "birthDate"]
+        
+        - query: "GET /Condition?patient={patient_id}&clinical-status=active"
+          store_as: "active_conditions"
+          limit: 50
+        
+        - query: "GET /MedicationRequest?patient={patient_id}&status=active"
+          store_as: "discharge_medications"
+          limit: 50
+        
+        - query: "GET /Observation?patient={patient_id}&code=length-of-stay"
+          store_as: "los_data"
+        
+        - query: "GET /Encounter?patient={patient_id}&status=finished&date=ge{90_days_ago}"
+          store_as: "recent_encounters"
+          limit: 10
+      
+      success_criteria: "All queries return data"
+      error_handling: "If query fails, use cached data or escalate to case manager"
+    
+    - step_id: "2_calculate_clinical_scores"
+      name: "Calculate Risk Scores"
+      description: "Invoke MCP tools for LACE+, Charlson, drug interactions"
+      actions:
+        - tool: "charlson_index_calculator"
+          inputs:
+            conditions: "active_conditions[].code"
+            age: "patient.birthDate"
+          store_as: "charlson_result"
+        
+        - tool: "lace_plus_calculator"
+          inputs:
+            age: "patient.birthDate"
+            length_of_stay_days: "encounter.period.length"
+            charlson_score: "charlson_result.score"
+            ed_visits_6mo: "recent_encounters.filter(type='ED').count"
+            er_visits_past: "recent_encounters.any(type='ER')"
+          store_as: "lace_result"
+        
+        - tool: "drug_interaction_checker"
+          inputs:
+            medications: "discharge_medications[]{medication_name, rxnorm_code}"
+          store_as: "interaction_result"
+      
+      success_criteria: "All tools return results within 30 seconds"
+      error_handling: "Use default risk estimates if tools time out"
+    
+    - step_id: "3_delegate_gap_analysis"
+      name: "Delegate to CareGap Agent"
+      description: "Identify clinical and follow-up gaps"
+      sub_agent_call:
+        agent: "CareGap"
+        inputs:
+          patient_id: "{patient_id}"
+          conditions: "active_conditions"
+          discharge_date: "encounter.period.end"
+          severity: "lace_result.risk_quintile"
+        timeout_seconds: 20
+        store_as: "care_gaps"
+      
+      success_criteria: "CareGap returns gap list within 20 seconds"
+      error_handling: "Generate default gaps (PCP follow-up, medication refills)"
+    
+    - step_id: "4_delegate_education_generation"
+      name: "Delegate to PatientEd Agent"
+      description: "Generate patient-friendly discharge instructions"
+      sub_agent_call:
+        agent: "PatientEd"
+        inputs:
+          patient_name: "patient.name[0].text"
+          conditions: "active_conditions"
+          medications: "discharge_medications"
+          risk_score: "lace_result"
+          care_gaps: "care_gaps.priority_actions"
+        timeout_seconds: 15
+        store_as: "patient_education"
+      
+      success_criteria: "PatientEd returns education packet within 15 seconds"
+      error_handling: "Use template-based education if agent times out"
+    
+    - step_id: "5_assemble_packet"
+      name: "Assemble Transition Care Packet"
+      description: "Combine all outputs into single structured document"
+      actions:
+        - template: "transition_care_packet"
+          inputs:
+            encounter: "{encounter}"
+            patient: "{patient}"
+            lace_score: "{lace_result}"
+            charlson_score: "{charlson_result}"
+            drug_interactions: "{interaction_result}"
+            care_gaps: "{care_gaps}"
+            patient_education: "{patient_education}"
+          output_format: "FHIR Bundle"
+          store_as: "transition_packet"
+    
+    - step_id: "6_output_and_notify"
+      name: "Output to EHR & Patient Portal"
+      description: "Send packet to EHR system and patient communication channel"
+      actions:
+        - action: "store_to_ehr"
+          resource_type: "DocumentReference"
+          content: "{transition_packet}"
+          title: "Transition Care Packet - {patient.name} - {encounter.period.end}"
+        
+        - action: "send_to_patient_portal"
+          template: "discharge_summary_patient_friendly"
+          recipient: "{patient.contact.email}"
+          content: "{patient_education}"
+        
+        - action: "notify_care_team"
+          recipients: ["primary_care_provider", "case_manager", "discharge_planner"]
+          message: "Transition Care Packet assembled for {patient.name}. LACE+ score: {lace_result.risk_quintile}"
+        
+        - action: "log_audit_trail"
+          event: "Transition Care Packet Generated"
+          timestamp: "now"
+          risk_score: "{lace_result.total_score}"
+          outcome_location: "{transition_packet.url}"
+  
+  # Overall SLA and error handling
+  sla:
+    target_completion_time: "60 seconds"
+    warning_threshold: "45 seconds"
+    critical_timeout: "120 seconds"
+  
+  error_recovery:
+    retries: 3
+    escalation: "case_manager_manual_review"
+    fallback: "use_template_based_packet"
+
+
+# ============================================================================
+# SUB-AGENT 1: CAREGAP AGENT
+# ============================================================================
+caregap_agent:
+  name: "CareGap"
+  type: "specialist"
+  description: "Identifies care gaps: missing follow-ups, unaddressed social determinants, specialty care needs"
+  
+  objectives:
+    - "Detect missing follow-up appointments (PCP, specialists)"
+    - "Identify unaddressed social determinants (housing, food insecurity, transportation)"
+    - "Flag medications that need specialty monitoring"
+    - "Recommend urgent vs routine interventions"
+  
+  system_context: |
+    You are the CareGap specialist agent for TransitionGuard.
+    
+    Your job: Analyze the patient's discharge data and identify gaps in their care plan.
+    
+    A "gap" is something the patient needs but doesn't have arranged:
+    - Missing follow-up appointment with primary care, cardiologist, endocrinologist, etc.
+    - No medication reconciliation documented
+    - Unaddressed social needs (housing instability, food insecurity, transportation barriers)
+    - No pain management plan
+    - No mental health referral (for depression, anxiety)
+    - No substance use disorder treatment
+    - No physical/occupational therapy after stroke or fall
+    
+    For each gap, generate an ACTION ITEM with:
+    - Who should do it (patient, PCP, case manager, specialist)
+    - When (urgent = within 3 days, routine = within 2 weeks)
+    - How (phone call, EHR message, referral order, social work consult)
+  
+  inputs:
+    patient_id: "UUID"
+    conditions: "FHIR Condition[] (active)"
+    discharge_date: "ISO date"
+    severity: "risk quintile (calculated by orchestrator)"
+  
+  process:
+    - step: "1_analyze_condition_patterns"
+      description: "Review active conditions and identify typical follow-up needs"
+      logic:
+        - if: "condition.code IN [I50, J44, I25, N18]"  # Heart failure, COPD, CAD, CKD
+          then: "require_cardiology_or_nephrology_followup"
+        
+        - if: "condition.code IN [E10, E11]"  # Diabetes
+          then: "require_endocrinology_and_foot_exam_followup"
+        
+        - if: "condition.code IN [I63, I64]"  # Stroke/TIA
+          then: "require_neurology_and_rehab_assessment"
+        
+        - if: "condition.code IN [F32, F33, F41]"  # Depression, anxiety
+          then: "require_mental_health_referral"
+        
+        - if: "condition.code IN [F10, F12, F14]"  # Substance use
+          then: "require_addiction_medicine_or_intensive_outpatient"
+    
+    - step: "2_screen_social_determinants"
+      description: "Check for documented social needs"
+      checks:
+        - "Housing stability documented?"
+        - "Food security assessed?"
+        - "Transportation barriers identified?"
+        - "Employment/disability status documented?"
+        - "Health literacy assessment done?"
+        - "Language/cultural needs identified?"
+      
+      action_if_gap: "Create social work referral task"
+    
+    - step: "3_medication_monitoring_gaps"
+      description: "Identify meds that need lab monitoring or specialist oversight"
+      examples:
+        - "Warfarin → INR monitoring in 3-5 days"
+        - "ACE inhibitors + CKD → K+ and creatinine monitoring"
+        - "Methotrexate → CBC and liver function monitoring"
+        - "Lithium → Serum lithium level and renal function"
+    
+    - step: "4_generate_priority_actions"
+      description: "Rank gaps by urgency and impact"
+      classification:
+        urgent: "If LACE+ = Very High AND care gap is life-threatening (anticoagulation gap, seizure meds)"
+        high: "If clinical gap directly linked to readmission risk (PCP follow-up, med reconciliation)"
+        routine: "If gap is optimization (PT/OT, wellness)"
+  
+  outputs:
+    care_gaps: [
+      {
+        "gap_id": "gap_001",
+        "gap_description": "Primary care follow-up",
+        "reason": "All discharged patients need PCP follow-up within 1-2 weeks",
+        "urgency": "high",
+        "due_date": "2026-04-05",
+        "action_items": [
+          {
+            "action": "Schedule PCP appointment",
+            "assigned_to": "discharge_planner",
+            "timeline": "Before patient leaves hospital",
+            "contact_method": "Phone"
+          }
+        ],
+        "readmission_impact": "Reduces readmission risk by 15%"
+      }
+    ]
+    total_gaps: "integer"
+    urgent_gaps_count: "integer"
+
+
+# ============================================================================
+# SUB-AGENT 2: PATIENTWED AGENT
+# ============================================================================
+patientedu_agent:
+  name: "PatientEd"
+  type: "specialist"
+  description: "Generates plain-language patient education and discharge instructions"
+  
+  objectives:
+    - "Convert clinical data into patient-friendly language"
+    - "Create actionable, step-by-step instructions"
+    - "Generate 'red flag' checklist (warning signs to watch)"
+    - "Explain medications in simple terms"
+    - "Embed LACE+ risk score in patient-understandable way"
+  
+  system_context: |
+    You are the PatientEd specialist agent for TransitionGuard.
+    
+    Your job: Take clinical information and turn it into a discharge instruction packet that a patient can actually understand.
+    
+    Principles:
+    1. Use plain English (max 6th grade reading level)
+    2. Avoid medical jargon (instead of "increased potassium", say "eat bananas and orange juice")
+    3. Use visuals: checkboxes, bullet points, icons for warning signs
+    4. Give specific, actionable steps (not just "take your medications")
+    5. Make it personal: use patient's name, specific doctor names
+    
+    Output: A PDF-ready packet with:
+    - Personalized welcome & importance message
+    - Medication list with plain-language descriptions
+    - When to take each medication (tie to meals, bedtime, etc.)
+    - Food/drink interactions ("Don't take with grapefruit juice")
+    - Warning signs checklist (what symptoms = call 911 vs call doctor)
+    - Follow-up appointments (with phone numbers)
+    - Community resources (transportation, food banks, mental health)
+  
+  inputs:
+    patient_name: "string"
+    conditions: "FHIR Condition[]"
+    medications: "FHIR MedicationRequest[]"
+    risk_score: "LACE+ output"
+    care_gaps: "outputs from CareGap agent"
+  
+  process:
+    - step: "1_personalized_introduction"
+      description: "Create welcome section that emphasizes importance"
+      template: |
+        "Dear {patient_name},
+        
+        You have been discharged from {hospital_name}. Your care team has prepared these instructions to help you recover at home safely.
+        
+        Your discharge is a critical time: most hospital readmissions occur in the first 30 days after leaving the hospital. 
+        
+        This packet will tell you EXACTLY what to do to stay healthy and avoid coming back to the hospital.
+        
+        Follow these instructions closely. If you have questions, call us right away.
+        
+        [Your Care Team]"
+    
+    - step: "2_medication_education"
+      description: "Create medication section with plain language"
+      per_medication:
+        - medication_name: "simplify brand name + strength"
+        - why_taking: "1-2 sentence explanation in plain language"
+        - how_to_take: "specific timing (morning, with food, etc.)"
+        - what_to_watch: "side effects or signs something is wrong"
+        - food_interactions: "what NOT to eat/drink with this med"
+        - example: |
+            "Metoprolol 25 mg
+            Why: This medication helps your heart work more efficiently and lowers your blood pressure.
+            How: Take ONE tablet by mouth every morning with breakfast.
+            What to watch: Dizziness, shortness of breath, very slow heartbeat (call doctor)
+            Avoid: Don't stop taking this without talking to your doctor first"
+    
+    - step: "3_warning_signs_checklist"
+      description: "Create red flag checklist - when to call 911 vs doctor"
+      format: "Checkbox list with icon"
+      sections:
+        call_911_immediately:
+          - "Chest pain or pressure"
+          - "Difficulty breathing"
+          - "Fainting or loss of consciousness"
+          - "Severe bleeding or sudden weakness"
+        call_doctor_today:
+          - "Fever >100.4°F (38°C)"
+          - "Wound opening or signs of infection (redness, pus)"
+          - "Severe nausea/vomiting (can't keep medicine down)"
+        routine_followup:
+          - "Mild swelling"
+          - "Minor bruising"
+          - "Fatigue"
+    
+    - step: "4_lace_risk_explanation"
+      description: "Explain readmission risk in patient-friendly terms"
+      logic:
+        - if: "lace_score.quintile == 'Very High'"
+          message: |
+            "Your doctors have assessed your recovery needs as HIGH PRIORITY.
+            This means you are at higher risk of coming back to the hospital in the next 30 days.
+            This is NOT your fault. It means you need extra help and support.
+            
+            WHAT TO DO:
+            ✓ Follow these instructions EXACTLY
+            ✓ Keep ALL follow-up appointments
+            ✓ Call your doctor at the FIRST sign of problems (don't wait)"
+        
+        - if: "lace_score.quintile == 'High'"
+          message: |
+            "Your recovery needs are IMPORTANT. Please follow these instructions carefully
+            and keep all your follow-up appointments."
+    
+    - step: "5_followup_appointments"
+      description: "List specific follow-up appointments with details"
+      per_appointment:
+        - doctor_name: "from care_gaps"
+        - specialty: "Cardiologist, Endocrinologist, etc."
+        - phone_number: "contact info"
+        - when: "specific date/time if scheduled, or 'within X days'"
+        - why: "plain language reason"
+        - what_to_bring: "insurance card, medication list, list of symptoms"
+    
+    - step: "6_community_resources"
+      description: "Add local resources for support"
+      examples:
+        - "Food banks (address, phone, hours)"
+        - "Free/low-cost clinic for medication refills"
+        - "Therapy/mental health resources"
+        - "Transportation services for elderly/disabled"
+        - "Senior centers and social services"
+  
+  outputs:
+    patient_education_packet: {
+      "format": "PDF",
+      "sections": [
+        "personalized_welcome",
+        "medication_education",
+        "warning_signs",
+        "followup_instructions",
+        "community_resources",
+        "emergency_contact_card"
+      ],
+      "reading_level": "6th grade",
+      "personalization": "patient_name, specific_medications, risk_level"
+    }
+
+
+# ============================================================================
+# DEPLOYMENT & COMMUNICATION
+# ============================================================================
+deployment:
+  platform: "Prompt Opinion"
+  mcp_server: "transition-guard-mcp"
+  mcp_tools: ["lace_plus_calculator", "charlson_index_calculator", "drug_interaction_checker"]
+  
+  # Inter-agent messaging protocol
+  messaging:
+    protocol: "A2A native"
+    timeout_handling: "sub-agent must respond within specified timeout or orchestrator uses fallback"
+    error_handling: |
+      - If CareGap times out: Use template-based gap list (PCP, med refills)
+      - If PatientEd times out: Use FHIR-standard discharge summary
+      - If MCP tools time out: Use baseline risk estimates
+  
+  # Output delivery
+  outputs:
+    transition_care_packet:
+      destination: "EHR Document storage"
+      format: "FHIR Bundle + PDF"
+      access_control: "Patient + care team"
+    
+    patient_education:
+      destination: "Patient portal + email"
+      format: "PDF + plain text"
+      accessibility: "ADA compliant (accessible for screen readers)"
+    
+    care_team_notification:
+      recipients: ["PCP", "case_manager", "discharge_planner", "specialists"]
+      format: "EHR alert + email"
+      urgency: "immediate for high-risk patients"
+  
+  # Audit & compliance
+  audit_trail:
+    events_logged:
+      - "Encounter discharge trigger"
+      - "FHIR queries executed"
+      - "MCP tools invoked (with inputs/outputs)"
+      - "Sub-agent delegations and results"
+      - "Packet assembly completion"
+      - "Output delivery"
+    compliance: "HIPAA audit trail, FHIR-compliant logging"
+
+
+# ============================================================================
+# TESTING & VALIDATION
+# ============================================================================
+testing:
+  scenarios:
+    - scenario: "Low-risk discharge (young, short stay, no comorbidities)"
+      expected_lace: "≤4 (Very Low)"
+      expected_gaps: "Minimal (PCP follow-up only)"
+      sla_target: "30 seconds"
+    
+    - scenario: "High-risk discharge (elderly, long stay, multiple comorbidities, frequent ER use)"
+      expected_lace: "≥13 (High/Very High)"
+      expected_gaps: "5-8 gaps (cardiology, nephrology, PT/OT, social work)"
+      sla_target: "55 seconds"
+    
+    - scenario: "Complex discharge (post-surgical, on anticoagulation, drug interactions)"
+      expected_interactions: "1-3 moderate/severe"
+      expected_actions: "Pharmacist review mandatory"
+      sla_target: "45 seconds"
+  
+  validation:
+    clinical_accuracy: "Compare generated packets to manually-created care plans by case managers"
+    readmission_prediction: "Track if LACE+ score predicts actual 30-day readmission"
+    patient_satisfaction: "Survey patients on clarity of instructions"
+    care_team_adoption: "Monitor if providers use packet in clinical decisions"
